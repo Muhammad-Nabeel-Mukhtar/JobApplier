@@ -4,6 +4,7 @@ python-dotenv==1.0.0
 PyPDF2==3.0.1
 python-docx==1.1.0
 spacy==3.7.2
-mongoengine==0.27.0
 pymongo==4.5.0
+mongoengine==0.27.0
 dnspython==2.3.0
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
