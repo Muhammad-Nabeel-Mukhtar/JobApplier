@@ -6,10 +6,12 @@ from dotenv import load_dotenv
 import PyPDF2
 import docx
 import re
+import csv
 import spacy
 from spacy.lang.en.stop_words import STOP_WORDS
-from mongoengine import connect, Document, StringField, ListField, IntField
+from mongoengine import connect, Document, StringField, ListField
 
+# ---- Load environment variables ----
 load_dotenv()
 SCRAPINGDOG_API_KEY = os.getenv("SCRAPINGDOG_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
@@ -22,47 +24,22 @@ UPLOAD_FOLDER = 'uploads'
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
-# -- Database Models --
-class User(Document):
-    email = StringField(required=True, unique=True)
-    password = StringField(required=True)
-    role = StringField(default='user')
+# ---- Load the master skills set ----
+def load_skills(filepath="techset_list.csv"):
+    skillset = set()
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                skill = row[0].strip().lower()
+                if skill:
+                    skillset.add(skill)
+    except Exception:
+        pass
+    return skillset
 
-class Resume(Document):
-    filename = StringField(required=True)
-    filepath = StringField()
-    tag = StringField()
-    skills = ListField(StringField())
-    user_email = StringField()  # For linkage to user
+SKILLS = load_skills()
 
-class Application(Document):
-    job_id = StringField()
-    resume_id = StringField()
-    user_email = StringField()
-    status = StringField(default='submitted')
-
-def is_valid_skill(phrase):
-    phrase = phrase.strip().lower()
-    if not phrase or phrase in STOP_WORDS:
-        return False
-    if re.search(r'\d{4}', phrase):  # Remove years like 2022, 2018
-        return False
-    if len(phrase) < 2 or len(phrase.split()) > 6:
-        return False
-    # Remove skills with mostly digits or symbols
-    if sum(c.isdigit() for c in phrase)/max(len(phrase),1) > 0.5:
-        return False
-    # Remove some common non-specific resume words
-    COMMON_IGNORE = [
-        'project', 'system', 'application', 'team', 'skills', 'experience', 'management', 'education',
-        'training', 'company', 'solution', 'organization', 'school', 'college', 'university',
-        'group', 'build', 'detail', 'task', 'work', 'role', 'resume', 'cv', 'objective',
-        'responsibilities', 'activities'
-    ]
-    if phrase in COMMON_IGNORE:
-        return False
-    return True
-
+# ---- Utility Functions ----
 def extract_text_from_pdf(file_path):
     text = ""
     try:
@@ -70,7 +47,7 @@ def extract_text_from_pdf(file_path):
             reader = PyPDF2.PdfReader(f)
             for page in reader.pages:
                 page_text = page.extract_text() or ""
-                text += page_text
+                text += page_text + "\n"
     except Exception:
         pass
     return text
@@ -84,20 +61,36 @@ def extract_text_from_docx(file_path):
         pass
     return text
 
-def nlp_extract_skills(text):
-    doc = nlp(text)
-    skills = set()
-    for chunk in doc.noun_chunks:
-        skill = chunk.text.strip().lower()
-        if is_valid_skill(skill):
-            skills.add(skill)
-    for token in doc:
-        if not token.is_stop and token.is_alpha and len(token.lemma_) > 2:
-            lemma = token.lemma_.lower()
-            if is_valid_skill(lemma):
-                skills.add(lemma)
-    return sorted(skills)
+def extract_job_skills(text):
+    found_skills = set()
+    text_lower = text.lower()
+    # Check for each skill as a whole word/phrase
+    for skill in SKILLS:
+        skill_regex = r"\b" + re.escape(skill) + r"\b"
+        if re.search(skill_regex, text_lower):
+            found_skills.add(skill)
+    return sorted(found_skills)
 
+# ---- Database Models ----
+class User(Document):
+    email = StringField(required=True, unique=True)
+    password = StringField(required=True)
+    role = StringField(default='user')
+
+class Resume(Document):
+    filename = StringField(required=True)
+    filepath = StringField()
+    tag = StringField()
+    skills = ListField(StringField())
+    user_email = StringField()
+
+class Application(Document):
+    job_id = StringField()
+    resume_id = StringField()
+    user_email = StringField()
+    status = StringField(default='submitted')
+
+# ---- API Endpoints ----
 @app.route('/api/register', methods=['POST'])
 def register():
     email = request.json.get('email')
@@ -137,7 +130,7 @@ def upload_resume():
     elif file.filename.lower().endswith('.docx'):
         text = extract_text_from_docx(filepath)
 
-    skills = nlp_extract_skills(text)
+    skills = extract_job_skills(text)
 
     resume = Resume(
         filename=file.filename,
@@ -181,12 +174,12 @@ def get_jobs():
         'ziprecruiter': 'ziprecruiterjobs'
     }
 
+    # Resume skills
     resume = Resume.objects(user_email=user_email).order_by('-id').first()
     resume_skills = set(resume.skills) if resume else set()
-
-    # Also combine resume skills with user's explicit search keywords!
-    search_terms = set(nlp_extract_skills(search))
-    full_match_set = resume_skills | search_terms
+    # User's search skills
+    search_skills = set(extract_job_skills(search))
+    full_match_set = resume_skills | search_skills
 
     def calc_match(job):
         job_fields = [
@@ -199,8 +192,8 @@ def get_jobs():
             job.get('job_posting_date', '')
         ]
         job_text = ' '.join([str(f) for f in job_fields if f])
-        job_skills = set(nlp_extract_skills(job_text))
-        # Match combines explicit search AND resume skills
+        job_skills = set(extract_job_skills(job_text))
+        # Match combines explicit job field skills with all extracted/known
         return len(full_match_set & job_skills)
 
     result = []
@@ -264,7 +257,5 @@ def get_applications():
     } for a in apps])
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
