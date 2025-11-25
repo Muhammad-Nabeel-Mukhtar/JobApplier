@@ -5,16 +5,12 @@ from dotenv import load_dotenv
 
 import PyPDF2
 import docx
-import re
-import csv
-import spacy
 from mongoengine import connect, Document, StringField, ListField
 
 # ---- Load environment variables ----
 load_dotenv()
 SCRAPINGDOG_API_KEY = os.getenv("SCRAPINGDOG_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
-nlp = spacy.load("en_core_web_sm")
 
 connect(host=MONGO_URI, alias="default", uuidRepresentation="standard")
 
@@ -23,22 +19,7 @@ UPLOAD_FOLDER = 'uploads'
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
-# ---- Load the master skills set ----
-def load_skills(filepath="techset_list.csv"):
-    skillset = set()
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            for row in csv.reader(f):
-                skill = row[0].strip().lower()
-                if skill:
-                    skillset.add(skill)
-    except Exception:
-        pass
-    return skillset
-
-SKILLS = load_skills()
-
-# ---- Utility Functions ----
+# ---- Utility for resume text extraction and skill parsing ----
 def extract_text_from_pdf(file_path):
     text = ""
     try:
@@ -60,13 +41,19 @@ def extract_text_from_docx(file_path):
         pass
     return text
 
-def extract_job_skills(text):
-    found_skills = set()
-    text_lower = text.lower()
-    for skill in SKILLS:
-        if skill in text_lower:  # substring match
-            found_skills.add(skill)
-    return sorted(found_skills)
+def simple_skill_extraction(text):
+    # Tokenize by words, keep unique lowercase tokens with length >= 4 (basic heuristics)
+    import re
+    tokens = set(re.findall(r'\b\w{4,}\b', text.lower()))
+    # Filter out common stop words (you can expand/remove as needed)
+    stopwords = set([
+        'about','above','after','again','against','among','because','been','before','being','below',
+        'between','both','but','can','could','did','does','doing','down','during','each','few',
+        'from','further','have','having','here','into','more','most','other','over','some','such',
+        'than','that','their','there','these','they','this','those','under','until','very','with','would'
+    ])
+    skills = [w for w in tokens if w not in stopwords]
+    return skills
 
 # ---- Database Models ----
 class User(Document):
@@ -78,8 +65,8 @@ class Resume(Document):
     filename = StringField(required=True)
     filepath = StringField()
     tag = StringField()
-    skills = ListField(StringField())
     user_email = StringField()
+    skills = ListField(StringField())
 
 class Application(Document):
     job_id = StringField()
@@ -120,21 +107,18 @@ def upload_resume():
     user_email = request.form['user_email']
     filepath = os.path.join(UPLOAD_FOLDER, file.filename)
     file.save(filepath)
-
     text = ""
     if file.filename.lower().endswith('.pdf'):
         text = extract_text_from_pdf(filepath)
     elif file.filename.lower().endswith('.docx'):
         text = extract_text_from_docx(filepath)
-
-    skills = extract_job_skills(text)
-
+    skills = simple_skill_extraction(text)
     resume = Resume(
         filename=file.filename,
         filepath=filepath,
         tag=tag,
-        skills=skills,
-        user_email=user_email
+        user_email=user_email,
+        skills=skills
     )
     resume.save()
     return jsonify({'msg': 'Resume uploaded', 'resume': {
@@ -158,8 +142,8 @@ def list_resumes():
 def get_jobs():
     search = request.args.get('search')
     location = request.args.get('location', 'Pakistan')
-    platform = request.args.get('platform', 'linkedin')  # default to linkedin
     user_email = request.args.get('user_email')
+    platform = request.args.get('platform', 'linkedin')
     page = int(request.args.get('page', '1'))
     if not search or not user_email:
         return jsonify({"error": "Missing search or user_email"}), 400
@@ -170,38 +154,35 @@ def get_jobs():
         'glassdoor': 'glassdoorjobs',
         'ziprecruiter': 'ziprecruiterjobs'
     }
-
-    resume = Resume.objects(user_email=user_email).order_by('-id').first()
-    resume_skills = set(resume.skills) if resume else set()
-    search_skills = set(extract_job_skills(search))
-    full_match_set = resume_skills | search_skills
-
-    # ScrapingDog API call (currently one platform—can be extended)
     endpoint = endpoint_map.get(platform, 'linkedinjobs')
     api_url = f"https://api.scrapingdog.com/{endpoint}?api_key={SCRAPINGDOG_API_KEY}&search={search}&location={location}&page={page}"
+
+    # Get user's latest resume skills
+    resume = Resume.objects(user_email=user_email).order_by('-id').first()
+    resume_skills = set(str(s).lower() for s in resume.skills) if resume else set()
 
     try:
         resp = requests.get(api_url)
         data = resp.json()
-
-        if isinstance(data, list):
-            for job in data:
-                job_fields = [
-                    job.get('job_position', ''),
-                    job.get('job_location', ''),
-                    job.get('company_name', ''),
-                    job.get('company_profile', ''),
-                    job.get('job_description', ''),
-                    job.get('description', ''),
-                    job.get('job_posting_date', '')
-                ]
-                job_text = ' '.join([str(f) for f in job_fields if f]).lower()
-                score = 0
-                for skill in full_match_set:
+        # Rank jobs by skills in job fields if resume is uploaded
+        for job in data:
+            job_fields = [
+                job.get('job_position', ''),
+                job.get('job_location', ''),
+                job.get('company_name', ''),
+                job.get('company_profile', ''),
+                job.get('job_description', ''),
+                job.get('description', ''),
+                job.get('job_posting_date', '')
+            ]
+            job_text = ' '.join([str(f) for f in job_fields if f]).lower()
+            match_count = 0
+            if resume_skills:
+                for skill in resume_skills:
                     if skill in job_text:
-                        score += 1
-                job['match_score'] = score
-            data = sorted(data, key=lambda x: x.get('match_score', 0), reverse=True)
+                        match_count += 1
+            job['match_score'] = match_count
+        data = sorted(data, key=lambda x: x.get('match_score', 0), reverse=True)
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 502
